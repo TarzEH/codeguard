@@ -16,11 +16,16 @@ Hardening and packaging on top of 2.0.0.
 - **Recorded demos** (VHS) for scanning, autoscaling and leader failover,
   embedded in the README.
 - **TTL index** on the cache so MongoDB expires entries nobody scans any more.
+- **Release tooling** (`scripts/release.sh`, `make release` / `make publish`):
+  builds the standalone CLI, a reproducible source tarball generated from the
+  tag, and `SHA256SUMS` covering both, then creates the GitHub release.
 - `.env.example`, `CHANGELOG.md`.
 
 ### Changed
-- CLI self-update now verifies the release archive against the published
-  `SHA256SUMS` and **refuses to install** when no checksums are published.
+- CLI self-update downloads the published `codeguard` asset and verifies it
+  against `SHA256SUMS` before replacing the installed file. It **refuses to
+  install** when a release publishes no checksums, and does not checksum
+  GitHub's auto-generated source archives (those are not byte-stable).
 - CVE lists in the report are capped at three ids so no line exceeds the
   74-column report width.
 - The autoscaler scales to *demand* rather than blindly doubling, so a spike

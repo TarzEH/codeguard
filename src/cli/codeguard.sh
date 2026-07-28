@@ -265,12 +265,15 @@ while getopts ":s:juhv" o; do
             exit $scan_rc
             ;;
         u)
-            # Update to the latest release, verifying the archive against the
-            # SHA256SUMS published with it. A security tool must not install
-            # code it cannot verify, so a missing checksum file is a hard stop
-            # rather than a warning.
+            # Self-update. The CLI is a single file, so the release ships it as
+            # a downloadable asset and this replaces itself with the verified
+            # copy. GitHub's auto-generated source archives are deliberately not
+            # used: they are not byte-stable, so checksumming them is unreliable.
+            #
+            # A security tool must not install code it cannot verify, so a
+            # missing or non-matching checksum is a hard stop, not a warning.
             set -e
-            repo="${CODEGUARD_REPO:-Naor-Yekutiely/codeguard}"
+            repo="${CODEGUARD_REPO:-TarzEH/codeguard}"
             workdir=$(mktemp -d "${TMPDIR:-/tmp}/codeguard-update.XXXXXX")
             trap 'rm -rf "$workdir"' EXIT
 
@@ -286,30 +289,31 @@ while getopts ":s:juhv" o; do
                 exit 0
             fi
 
+            asset_url=$(printf '%s' "$release" \
+                | jq -r '.assets[]? | select(.name=="codeguard") | .browser_download_url')
             sums_url=$(printf '%s' "$release" \
                 | jq -r '.assets[]? | select(.name=="SHA256SUMS") | .browser_download_url')
-            if [ -z "$sums_url" ] || [ "$sums_url" = "null" ]; then
-                printf 'Release %s publishes no SHA256SUMS - refusing to install unverified code.\n' "$latest_tag" >&2
-                printf 'Install manually from source if you trust it.\n' >&2
+            if [ -z "$asset_url" ] || [ "$asset_url" = "null" ] \
+               || [ -z "$sums_url" ] || [ "$sums_url" = "null" ]; then
+                printf 'Release %s does not publish a verifiable CLI asset - refusing to update.\n' \
+                    "$latest_tag" >&2
                 exit 2
             fi
 
-            tarball="codeguard-${latest_tag:1}.tar.gz"
             printf 'Fetching codeguard %s\n' "$latest_tag"
-            curl -sS --fail --proto '=https' --tlsv1.2 -L \
-                -o "$workdir/$tarball" \
-                "https://github.com/$repo/archive/refs/tags/$latest_tag.tar.gz"
+            curl -sS --fail --proto '=https' --tlsv1.2 -L -o "$workdir/codeguard" "$asset_url"
             curl -sS --fail --proto '=https' --tlsv1.2 -L -o "$workdir/SHA256SUMS" "$sums_url"
 
-            expected=$(awk -v f="$tarball" '$2 == f || $2 == "*"f {print $1}' "$workdir/SHA256SUMS" | head -1)
+            expected=$(awk '$2 == "codeguard" || $2 == "*codeguard" {print $1}' \
+                "$workdir/SHA256SUMS" | head -1)
             if [ -z "$expected" ]; then
-                printf 'SHA256SUMS has no entry for %s - refusing to install.\n' "$tarball" >&2
+                printf 'SHA256SUMS has no entry for the CLI - refusing to install.\n' >&2
                 exit 2
             fi
             if command -v sha256sum >/dev/null 2>&1; then
-                actual=$(sha256sum "$workdir/$tarball" | awk '{print $1}')
+                actual=$(sha256sum "$workdir/codeguard" | awk '{print $1}')
             else
-                actual=$(shasum -a 256 "$workdir/$tarball" | awk '{print $1}')
+                actual=$(shasum -a 256 "$workdir/codeguard" | awk '{print $1}')
             fi
             if [ "$expected" != "$actual" ]; then
                 printf 'Checksum mismatch - refusing to install.\n  expected %s\n  actual   %s\n' \
@@ -318,8 +322,14 @@ while getopts ":s:juhv" o; do
             fi
             printf 'Checksum verified.\n'
 
-            tar -xf "$workdir/$tarball" -C "$workdir"
-            (cd "$workdir/codeguard-${latest_tag:1}/src/cli" && ./install_cli.sh)
+            target=$(command -v codeguard || echo /usr/local/bin/codeguard)
+            chmod 0755 "$workdir/codeguard"
+            if [ -w "$(dirname "$target")" ]; then
+                install -m 0755 "$workdir/codeguard" "$target"
+            else
+                sudo install -m 0755 "$workdir/codeguard" "$target"
+            fi
+            printf 'Updated %s to %s\n' "$target" "$latest_tag"
             set +e
             ;;
         h)

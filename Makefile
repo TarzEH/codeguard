@@ -3,7 +3,7 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 VENV := .venv
 
-.PHONY: help install up down restart status logs shell test failover-test lint scale autoscale clean load-test
+.PHONY: help install up down restart status logs shell test failover-test lint scale autoscale clean load-test release publish
 
 help: ## Show this help
 	@echo ""
@@ -70,7 +70,13 @@ load-test: $(VENV) ## Load test the API
 	@$(VENV)/bin/pip -q install requests
 	@$(VENV)/bin/python overload-test-scripts/overload_cli.py --requests $(or $(N),200) --concurrency $(or $(C),20)
 
+release: ## Build release artifacts into dist/
+	@./scripts/release.sh
+
+publish: ## Build and publish the GitHub release (requires gh)
+	@./scripts/release.sh --publish
+
 clean: ## Stop everything and delete volumes (destroys the cache)
 	@$(COMPOSE) --profile autoscale down -v --remove-orphans
-	@rm -rf $(VENV) .pytest_cache
+	@rm -rf $(VENV) .pytest_cache dist
 	@echo "  cluster and volumes removed"
