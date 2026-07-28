@@ -1,137 +1,304 @@
-version: '3.7'
+name: codeguard
 
-services:    
-  backend1:
-    build:
-      context: .
-      dockerfile: ./src/infra/backend.Dockerfile
-    container_name: backend1
-    ports:
-      - "5001:5000"
-  backend2:
-    build:
-      context: .
-      dockerfile: ./src/infra/backend.Dockerfile
-    container_name: backend2
-    ports:
-      - "5002:5000"
-  backend3:
-    build:
-      context: .
-      dockerfile: ./src/infra/backend.Dockerfile
-    container_name: backend3
-    ports:
-      - "5003:5000"
-  backend4:
-    build:
-      context: .
-      dockerfile: ./src/infra/backend.Dockerfile
-    container_name: backend4
-    ports:
-      - "5004:5000"
-   
-  
-  haproxy:
-    hostname: haproxy
-    container_name: haproxy
-    build: 
-      context: ./src/infra/
-      dockerfile: haproxy.Dockerfile
-    ports:
-       - '80:80'
-       - '8404:8404'   
-    depends_on:
-      - backend1
-      - backend2
-      - backend3
-      - backend4
+# Backend configuration. Every replica is identical and anonymous - no NODE_ID,
+# no container_name - which is what lets the service be scaled up and down.
+# Identity comes from the container hostname; coordination comes from ZooKeeper.
+x-backend-env: &backend-env
+  MONGO_URI: mongodb://${MONGO_APP_USERNAME:-codeguard_app}:${MONGO_APP_PASSWORD:-changeme_app}@mongos:27017/${MONGO_DB:-codeguard}?authSource=${MONGO_DB:-codeguard}
+  MONGO_DB: ${MONGO_DB:-codeguard}
+  ZK_ENABLED: "true"
+  ZK_HOSTS: zoo1:2181,zoo2:2181,zoo3:2181
+  CACHE_TTL_SECONDS: "21600"
+  REFRESH_ENABLED: "true"
+  REFRESH_INTERVAL_SECONDS: "900"
+  UPSTREAM_RATE_LIMIT: "40"
+  UPSTREAM_RATE_WINDOW_SECONDS: "30"
+  NVD_FALLBACK_ENABLED: "false"
+  LOG_LEVEL: INFO
 
-  mongo_cfgserv:
-    build:
-      context: .
-      dockerfile: ./src/infra/mongocfg.Dockerfile
-    hostname: mongo_cfgserv
-    container_name: mongo_cfgserv
-    command: mongod --configsvr --replSet cfgrs --bind_ip 0.0.0.0 --port 27017 --dbpath /data/db
+# Credentials shared by the one-shot init containers.
+x-mongo-admin-env: &mongo-admin-env
+  MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-codeguard_root}
+  MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme_root}
+  MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-codeguard_app}
+  MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-changeme_app}
+  MONGO_DB: ${MONGO_DB:-codeguard}
+
+# `ping` is one of the few commands MongoDB answers without authentication,
+# so the health check keeps working once auth is enabled.
+x-mongod-healthcheck: &mongod-healthcheck
+  test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1})"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 20s
+
+# NOTE on the mongod flags below: --keyFile turns on internal (member-to-member)
+# authentication AND client authentication. WiredTiger's cache is capped because
+# it otherwise reserves ~50% of host RAM *per mongod*, which OOM-kills a
+# four-node cluster on a laptop.
+
+services:
+
+  # ----------------------------------------------------------------- ZooKeeper
+  # Three nodes, not one. ZooKeeper decides by majority: a single-node ensemble
+  # has no quorum to lose, so it provides no fault tolerance at all.
+  zoo1:
+    image: zookeeper:3.9.5
+    container_name: zoo1
+    hostname: zoo1
+    restart: unless-stopped
+    environment: &zoo-env
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181
+      ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok,stat,mntr
+      JVMFLAGS: "-Xms64m -Xmx256m"
+      ZOO_MY_ID: 1
+    volumes:
+      - zoo1_data:/data
+      - zoo1_datalog:/datalog
+    healthcheck: &zoo-healthcheck
+      test: ["CMD-SHELL", "zkServer.sh status 2>&1 | grep -qE 'Mode: (leader|follower|standalone)'"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 25s
+
+  zoo2:
+    image: zookeeper:3.9.5
+    container_name: zoo2
+    hostname: zoo2
+    restart: unless-stopped
     environment:
-      MONGO_INITDB_DATABASE: codegard
-    ports:
-      - 27015:27017
+      <<: *zoo-env
+      ZOO_MY_ID: 2
+    volumes:
+      - zoo2_data:/data
+      - zoo2_datalog:/datalog
+    healthcheck: *zoo-healthcheck
+
+  zoo3:
+    image: zookeeper:3.9.5
+    container_name: zoo3
+    hostname: zoo3
+    restart: unless-stopped
+    environment:
+      <<: *zoo-env
+      ZOO_MY_ID: 3
+    volumes:
+      - zoo3_data:/data
+      - zoo3_datalog:/datalog
+    healthcheck: *zoo-healthcheck
+
+  # ------------------------------------------------------------------- MongoDB
+  # Generates the shared cluster keyfile once, into a named volume. It is a
+  # secret, so it is created at runtime rather than committed.
+  mongo_keyfile:
+    image: mongo:8.0
+    container_name: mongo_keyfile
+    restart: "no"
+    volumes:
+      - mongo_keyfile:/keyfile
+    command: >
+      bash -c "test -s /keyfile/mongo.key ||
+               (openssl rand -base64 756 > /keyfile/mongo.key);
+               chmod 400 /keyfile/mongo.key;
+               chown 999:999 /keyfile/mongo.key;
+               echo 'keyfile ready'"
+
+  # 8.0 is the current LTS. 8.2/8.3 exist but are rapid releases, which MongoDB
+  # ships for evaluation rather than production.
+  mongo_cfgserv:
+    image: mongo:8.0
+    container_name: mongo_cfgserv
+    hostname: mongo_cfgserv
+    restart: unless-stopped
+    command: >-
+      mongod --configsvr --replSet cfgrs --bind_ip_all --port 27017
+      --dbpath /data/db --keyFile /keyfile/mongo.key --wiredTigerCacheSizeGB 0.25
     volumes:
       - cfgsvr:/data/db
-      - ./src/mongoDB/mongo-data/mongo-config:/data/db
-
-  mongos:
-    build:
-      context: .
-      dockerfile: ./src/infra/mongos.Dockerfile
-    hostname: mongos
-    container_name: mongos
-    ports:
-      - 27017:27017
-    volumes:
-      - ./src/mongoDB/mongo-data/mongos:/data/db
-      - ./src/mongoDB/mongos.js:/docker-entrypoint-initdb.d/mongos.js
-    command: mongos --configdb cfgrs/mongo_cfgserv:27017 --bind_ip 0.0.0.0 --port 27017
+      - mongo_keyfile:/keyfile:ro
     depends_on:
-      - mongodb1
-      - mongodb2
-      - mongodb3
-      - mongo_cfgserv
+      mongo_keyfile: {condition: service_completed_successfully}
+    healthcheck: *mongod-healthcheck
 
-
-  mongodb1:
-    build:
-      context: .
-      dockerfile: ./src/infra/mongo.Dockerfile
+  mongodb1: &shard-node
+    image: mongo:8.0
     container_name: mongodb1
     hostname: mongodb1
-    command: mongod --shardsvr --bind_ip 0.0.0.0 --port 27017 --replSet rs0 --dbpath /data/db
-    environment:
-      MONGO_INITDB_DATABASE: codegard
-    ports:
-      - "27016:27017"
+    restart: unless-stopped
+    command: >-
+      mongod --shardsvr --replSet rs0 --bind_ip_all --port 27017
+      --dbpath /data/db --keyFile /keyfile/mongo.key --wiredTigerCacheSizeGB 0.25
     volumes:
       - mongodb1:/data/db
-      - ./src/mongoDB/mongo-data/mongodb1:/data/db
-      - ./src/mongoDB/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js
+      - mongo_keyfile:/keyfile:ro
     depends_on:
-      - mongodb2
-      - mongodb3
-      - mongo_cfgserv
+      mongo_keyfile: {condition: service_completed_successfully}
+    healthcheck: *mongod-healthcheck
 
-    
-          
   mongodb2:
-    image: mongo
+    <<: *shard-node
     container_name: mongodb2
     hostname: mongodb2
-    command: mongod --shardsvr --bind_ip 0.0.0.0 --port 27017 --replSet rs0 --dbpath /data/db
-    environment:
-      MONGO_INITDB_DATABASE: codegard
-    ports:
-      - "27018:27017"
     volumes:
       - mongodb2:/data/db
-      - ./src/mongoDB/mongo-data/mongodb2:/data/db
- 
+      - mongo_keyfile:/keyfile:ro
 
   mongodb3:
-    image: mongo
+    <<: *shard-node
     container_name: mongodb3
     hostname: mongodb3
-    command: mongod --shardsvr --bind_ip 0.0.0.0 --port 27017 --replSet rs0 --dbpath /data/db
-    environment:
-      MONGO_INITDB_DATABASE: codegard
-    ports:
-      - "27019:27017"
     volumes:
       - mongodb3:/data/db
-      - ./src/mongoDB/mongo-data/mongodb3:/data/db
-  
+      - mongo_keyfile:/keyfile:ro
+
+  # These two share a mongod's network namespace on purpose: with keyfile auth
+  # and no users yet, MongoDB's localhost exception is the only way in, and it
+  # only accepts connections originating on the node itself.
+  mongo_cfg_init:
+    image: mongo:8.0
+    container_name: mongo_cfg_init
+    restart: "no"
+    network_mode: "service:mongo_cfgserv"
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-cfg-rs.sh"]
+    depends_on:
+      mongo_cfgserv: {condition: service_healthy}
+
+  mongo_shard_init:
+    image: mongo:8.0
+    container_name: mongo_shard_init
+    restart: "no"
+    network_mode: "service:mongodb1"
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-shard-rs.sh"]
+    depends_on:
+      mongodb1: {condition: service_healthy}
+      mongodb2: {condition: service_healthy}
+      mongodb3: {condition: service_healthy}
+
+  mongos:
+    image: mongo:8.0
+    container_name: mongos
+    hostname: mongos
+    restart: unless-stopped
+    command: >-
+      mongos --configdb cfgrs/mongo_cfgserv:27017 --bind_ip_all --port 27017
+      --keyFile /keyfile/mongo.key
+    volumes:
+      - mongo_keyfile:/keyfile:ro
+    ports:
+      # Loopback only, and now password protected. The old setup published every
+      # mongod on 0.0.0.0 with no authentication at all.
+      - "127.0.0.1:27017:27017"
+    depends_on:
+      mongo_cfg_init: {condition: service_completed_successfully}
+      mongo_shard_init: {condition: service_completed_successfully}
+    healthcheck: *mongod-healthcheck
+
+  # Creates the root and application users via the localhost exception, which
+  # closes permanently once the first user exists.
+  mongo_user_init:
+    image: mongo:8.0
+    container_name: mongo_user_init
+    restart: "no"
+    network_mode: "service:mongos"
+    environment: *mongo-admin-env
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-users.sh"]
+    depends_on:
+      mongos: {condition: service_healthy}
+
+  # addShard + enableSharding + shardCollection + indexes, authenticated.
+  mongo_sharding_init:
+    image: mongo:8.0
+    container_name: mongo_sharding_init
+    restart: "no"
+    environment: *mongo-admin-env
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-sharding.sh"]
+    depends_on:
+      mongo_user_init: {condition: service_completed_successfully}
+
+  # ------------------------------------------------------------------- Backend
+  # A single replicated service, NOT backend1..backend4. Named services are
+  # fixed at author time; a replicated one scales at run time:
+  #     docker compose up -d --scale backend=10
+  # HAProxy discovers the replicas over Docker DNS, so nothing else changes.
+  #
+  # Starts at ONE replica. Capacity that is idle most of the time is just cost;
+  # the autoscaler adds replicas when load actually arrives.
+  backend:
+    build:
+      context: .
+      dockerfile: ./src/infra/backend.Dockerfile
+    restart: unless-stopped
+    environment: *backend-env
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-1}
+    depends_on:
+      mongo_sharding_init: {condition: service_completed_successfully}
+      zoo1: {condition: service_healthy}
+      zoo2: {condition: service_healthy}
+      zoo3: {condition: service_healthy}
+
+  # ------------------------------------------------------------------- HAProxy
+  haproxy:
+    build:
+      context: ./src/infra/
+      dockerfile: haproxy.Dockerfile
+    container_name: haproxy
+    hostname: haproxy
+    restart: unless-stopped
+    environment:
+      HAPROXY_STATS_PASSWORD: ${HAPROXY_STATS_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:8404:8404"
+    depends_on:
+      backend: {condition: service_healthy}
+
+  # ---------------------------------------------------------------- Autoscaler
+  # Opt-in:  docker compose --profile autoscale up -d
+  # Watches HAProxy and scales the backend service between MIN and MAX.
+  # The host path is mounted at the same path inside the container so that
+  # `docker compose` resolves the build context identically either side.
+  autoscaler:
+    image: docker:28-cli
+    container_name: codeguard_autoscaler
+    profiles: ["autoscale"]
+    restart: unless-stopped
+    environment:
+      HAPROXY_STATS_PASSWORD: ${HAPROXY_STATS_PASSWORD:-changeme}
+      STATS_URL: "http://haproxy:8404/;csv"
+      MIN_REPLICAS: ${MIN_REPLICAS:-1}
+      MAX_REPLICAS: ${MAX_REPLICAS:-12}
+      SCALE_UP_AT: ${SCALE_UP_AT:-8}
+      SCALE_DOWN_AT: ${SCALE_DOWN_AT:-2}
+      INTERVAL: ${AUTOSCALE_INTERVAL:-15}
+      COOLDOWN: ${AUTOSCALE_COOLDOWN:-60}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache bash curl >/dev/null 2>&1 && exec bash scripts/autoscale.sh"]
+    depends_on:
+      haproxy: {condition: service_started}
 
 volumes:
-  cfgsvr: {}
-  mongodb1: {}
-  mongodb2: {}
-  mongodb3: {}
+  cfgsvr:
+  mongodb1:
+  mongodb2:
+  mongodb3:
+  mongo_keyfile:
+  zoo1_data:
+  zoo1_datalog:
+  zoo2_data:
+  zoo2_datalog:
+  zoo3_data:
+  zoo3_datalog:

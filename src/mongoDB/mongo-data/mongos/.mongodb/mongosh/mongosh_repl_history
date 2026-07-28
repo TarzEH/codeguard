@@ -1,8 +1,0 @@
-db.codegard_cache.find()
-use codegard
-db.codegard_cache.find()
-db.codegard_cache.find({ "name": "requests" })
-db.codegard_cache.find(query)
-use codegard
-sh.addShard("rs0/mongodb1:27017,mongodb2:27017,mongodb3:27017")
-use codegard
