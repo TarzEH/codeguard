@@ -18,3 +18,8 @@ src/mongoDB/mongo-data/
 
 # Written by the CLI while building a scan request
 dep.json
+
+# The demo fixture needs a .git directory to trigger the repository scan,
+# but a nested git repo must not be committed. Recreate it with:
+#   mkdir -p demo/sample-project/.git
+demo/sample-project/.git/

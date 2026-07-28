@@ -14,27 +14,9 @@ and which version fixes them.
 Originally a Ruppin distributed-systems final project; **v2** rebuilt the
 scanning core, the coordination layer and the deployment.
 
-```console
-$ codeguard
-
-╭────────────────────────────────────────────────────────────────────────╮
-│ codeguard v2.0.0                                                       │
-╰────────────────────────────────────────────────────────────────────────╯
-
-  5 packages scanned  ·  4 vulnerable  · node c54ec21f3bfc
-
-  HIGH      flask 2.2.2                        4 advisories
-            CVE-2023-30861, CVE-2026-27205
-            upgrade → 3.1.3
-
-  HIGH      urllib3 1.26.5                     16 advisories
-            CVE-2023-43804, CVE-2023-45803, CVE-2024-37891, CVE-2025-50181 +4 more
-            upgrade → 2.7.0
-
-  MODERATE  requests 2.28.1                    8 advisories
-            CVE-2023-32681, CVE-2024-35195, CVE-2024-47081, CVE-2026-25645
-            upgrade → 2.33.0
-```
+<p align="center">
+  <img src="assets/demo-scan.gif" alt="codeguard scanning a project" width="820">
+</p>
 
 ---
 
@@ -44,8 +26,13 @@ Requires Docker, Docker Compose, `jq`, and optionally `pipreqs`.
 
 ```bash
 git clone https://github.com/Naor-Yekutiely/codeguard.git && cd codeguard
-HAPROXY_STATS_PASSWORD=$(openssl rand -hex 12) docker compose up -d
-sudo ./src/cli/install_cli.sh          # puts `codeguard` on your PATH
+./install.sh
+```
+
+The installer checks prerequisites, generates random credentials into `.env`,
+builds and starts the cluster, runs a smoke scan, and installs the CLI. Then:
+
+```bash
 cd /path/to/your/project && codeguard
 ```
 
@@ -199,6 +186,10 @@ docker compose --profile autoscale up -d                        # automatic
 New replicas join the ZooKeeper election automatically and start serving within
 about 5 seconds — the DNS hold interval.
 
+<p align="center">
+  <img src="assets/demo-autoscale.gif" alt="the cluster scaling from 1 to 8 replicas and back" width="740">
+</p>
+
 Measured on a 40-connection load test, starting from one replica:
 
 | t | replicas | what the autoscaler saw |
@@ -304,6 +295,28 @@ So v1 had leader election with no leader job. v2 reintroduces it with one.
 
 ---
 
+## Security
+
+| Control | Status |
+|---|---|
+| MongoDB authentication | SCRAM users + keyfile internal auth on every node |
+| Least privilege | the backend's user has `readWrite` on `codeguard` only — no cluster admin |
+| Credentials | generated per install into `.env` (mode 600, git-ignored); never committed |
+| Network exposure | only HAProxy (`:80`) and the stats page (`:8404`) are published, both to loopback; `mongos` is loopback-only and password protected |
+| HAProxy stats | HTTP basic auth, password from the environment |
+| Containers | run as a non-root user |
+| CLI self-update | refuses to install a release that does not publish a verified `SHA256SUMS` |
+| Failure mode | fail-closed: an unanswerable scan is an error, never a clean result |
+
+Verify auth is on:
+
+```bash
+docker exec mongos mongosh --quiet --eval 'db.getSiblingDB("codeguard").vulnerability_cache.countDocuments({})'
+# MongoServerError: Command aggregate requires authentication
+```
+
+---
+
 ## Configuration
 
 Everything is environment-driven; no source edits required.
@@ -313,7 +326,8 @@ Everything is environment-driven; no source edits required.
 | `BACKEND_REPLICAS` | `1` | Initial replica count (autoscaler grows it) |
 | `MIN_REPLICAS` / `MAX_REPLICAS` | `1` / `12` | Autoscaler bounds |
 | `HAPROXY_STATS_PASSWORD` | `changeme` | **Change this.** Guards the stats page |
-| `MONGO_URI` | `mongodb://mongos:27017` | Cluster router |
+| `MONGO_ROOT_USERNAME` / `_PASSWORD` | generated | Cluster admin, used only by the init containers |
+| `MONGO_APP_USERNAME` / `_PASSWORD` | generated | What the backend authenticates with |
 | `ZK_HOSTS` | `zoo1:2181,zoo2:2181,zoo3:2181` | Ensemble members |
 | `ZK_ENABLED` | `true` | `false` runs standalone (always leader, local rate limit) |
 | `CACHE_TTL_SECONDS` | `21600` | How long a cached answer stays authoritative |
@@ -337,13 +351,9 @@ The failover test is the evidence behind the HA claim — it asserts that exactl
 one leader exists, that killing it elects a new one, that scans keep succeeding
 with a replica down, and that the recovered node rejoins without a split brain.
 
-```console
-$ ./tests/integration/failover_test.sh
-[1] exactly one leader at steady state          PASS  (codeguard-backend-1)
-[2] leadership moves when the leader dies       PASS  (new leader in 1s)
-[3] scans keep working with a backend down      PASS  (8/8 scans succeeded)
-[4] recovered node rejoins without split brain  PASS
-```
+<p align="center">
+  <img src="assets/demo-failover.gif" alt="killing the leader and watching a new one get elected" width="760">
+</p>
 
 ### Load testing
 

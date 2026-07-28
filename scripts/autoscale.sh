@@ -52,9 +52,12 @@ healthy_servers() {
 scale_to() {
     local target=$1
     log "scaling backend -> $target replicas"
+    # --no-deps is essential: without it, `up --scale` re-runs the whole
+    # dependency chain (including the one-shot Mongo init containers) on every
+    # scaling action, which is slow and can fail the command outright.
     # --no-recreate leaves existing containers alone, so scaling does not
     # restart healthy replicas (and does not drop the current leader).
-    if docker compose up -d --no-recreate --scale "backend=$target" backend >/dev/null 2>&1; then
+    if docker compose up -d --no-deps --no-recreate --scale "backend=$target" backend >/dev/null 2>&1; then
         last_action=$(date +%s)
         log "scaled to $target"
     else

@@ -4,8 +4,8 @@ name: codeguard
 # no container_name - which is what lets the service be scaled up and down.
 # Identity comes from the container hostname; coordination comes from ZooKeeper.
 x-backend-env: &backend-env
-  MONGO_URI: mongodb://mongos:27017
-  MONGO_DB: codeguard
+  MONGO_URI: mongodb://${MONGO_APP_USERNAME:-codeguard_app}:${MONGO_APP_PASSWORD:-changeme_app}@mongos:27017/${MONGO_DB:-codeguard}?authSource=${MONGO_DB:-codeguard}
+  MONGO_DB: ${MONGO_DB:-codeguard}
   ZK_ENABLED: "true"
   ZK_HOSTS: zoo1:2181,zoo2:2181,zoo3:2181
   CACHE_TTL_SECONDS: "21600"
@@ -16,12 +16,27 @@ x-backend-env: &backend-env
   NVD_FALLBACK_ENABLED: "false"
   LOG_LEVEL: INFO
 
+# Credentials shared by the one-shot init containers.
+x-mongo-admin-env: &mongo-admin-env
+  MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-codeguard_root}
+  MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme_root}
+  MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-codeguard_app}
+  MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-changeme_app}
+  MONGO_DB: ${MONGO_DB:-codeguard}
+
+# `ping` is one of the few commands MongoDB answers without authentication,
+# so the health check keeps working once auth is enabled.
 x-mongod-healthcheck: &mongod-healthcheck
   test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ping:1})"]
   interval: 10s
   timeout: 5s
   retries: 12
   start_period: 20s
+
+# NOTE on the mongod flags below: --keyFile turns on internal (member-to-member)
+# authentication AND client authentication. WiredTiger's cache is capped because
+# it otherwise reserves ~50% of host RAM *per mongod*, which OOM-kills a
+# four-node cluster on a laptop.
 
 services:
 
@@ -75,6 +90,21 @@ services:
     healthcheck: *zoo-healthcheck
 
   # ------------------------------------------------------------------- MongoDB
+  # Generates the shared cluster keyfile once, into a named volume. It is a
+  # secret, so it is created at runtime rather than committed.
+  mongo_keyfile:
+    image: mongo:8.0
+    container_name: mongo_keyfile
+    restart: "no"
+    volumes:
+      - mongo_keyfile:/keyfile
+    command: >
+      bash -c "test -s /keyfile/mongo.key ||
+               (openssl rand -base64 756 > /keyfile/mongo.key);
+               chmod 400 /keyfile/mongo.key;
+               chown 999:999 /keyfile/mongo.key;
+               echo 'keyfile ready'"
+
   # 8.0 is the current LTS. 8.2/8.3 exist but are rapid releases, which MongoDB
   # ships for evaluation rather than production.
   mongo_cfgserv:
@@ -82,52 +112,70 @@ services:
     container_name: mongo_cfgserv
     hostname: mongo_cfgserv
     restart: unless-stopped
-    command: mongod --configsvr --replSet cfgrs --bind_ip_all --port 27017 --dbpath /data/db --wiredTigerCacheSizeGB 0.25
+    command: >-
+      mongod --configsvr --replSet cfgrs --bind_ip_all --port 27017
+      --dbpath /data/db --keyFile /keyfile/mongo.key --wiredTigerCacheSizeGB 0.25
     volumes:
       - cfgsvr:/data/db
+      - mongo_keyfile:/keyfile:ro
+    depends_on:
+      mongo_keyfile: {condition: service_completed_successfully}
     healthcheck: *mongod-healthcheck
 
-  mongodb1:
+  mongodb1: &shard-node
     image: mongo:8.0
     container_name: mongodb1
     hostname: mongodb1
     restart: unless-stopped
-    command: mongod --shardsvr --replSet rs0 --bind_ip_all --port 27017 --dbpath /data/db --wiredTigerCacheSizeGB 0.25
+    command: >-
+      mongod --shardsvr --replSet rs0 --bind_ip_all --port 27017
+      --dbpath /data/db --keyFile /keyfile/mongo.key --wiredTigerCacheSizeGB 0.25
     volumes:
       - mongodb1:/data/db
+      - mongo_keyfile:/keyfile:ro
+    depends_on:
+      mongo_keyfile: {condition: service_completed_successfully}
     healthcheck: *mongod-healthcheck
 
   mongodb2:
-    image: mongo:8.0
+    <<: *shard-node
     container_name: mongodb2
     hostname: mongodb2
-    restart: unless-stopped
-    command: mongod --shardsvr --replSet rs0 --bind_ip_all --port 27017 --dbpath /data/db --wiredTigerCacheSizeGB 0.25
     volumes:
       - mongodb2:/data/db
-    healthcheck: *mongod-healthcheck
+      - mongo_keyfile:/keyfile:ro
 
   mongodb3:
-    image: mongo:8.0
+    <<: *shard-node
     container_name: mongodb3
     hostname: mongodb3
-    restart: unless-stopped
-    command: mongod --shardsvr --replSet rs0 --bind_ip_all --port 27017 --dbpath /data/db --wiredTigerCacheSizeGB 0.25
     volumes:
       - mongodb3:/data/db
-    healthcheck: *mongod-healthcheck
+      - mongo_keyfile:/keyfile:ro
 
-  # One-shot: initiates both replica sets, then exits. mongos cannot start
-  # before the config replica set exists, hence the separate init step.
-  mongo_replicaset_init:
+  # These two share a mongod's network namespace on purpose: with keyfile auth
+  # and no users yet, MongoDB's localhost exception is the only way in, and it
+  # only accepts connections originating on the node itself.
+  mongo_cfg_init:
     image: mongo:8.0
-    container_name: mongo_replicaset_init
+    container_name: mongo_cfg_init
     restart: "no"
+    network_mode: "service:mongo_cfgserv"
     volumes:
       - ./src/infra/mongo-init:/scripts:ro
-    command: ["bash", "/scripts/init-replicasets.sh"]
+    command: ["bash", "/scripts/init-cfg-rs.sh"]
     depends_on:
       mongo_cfgserv: {condition: service_healthy}
+
+  mongo_shard_init:
+    image: mongo:8.0
+    container_name: mongo_shard_init
+    restart: "no"
+    network_mode: "service:mongodb1"
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-shard-rs.sh"]
+    depends_on:
       mongodb1: {condition: service_healthy}
       mongodb2: {condition: service_healthy}
       mongodb3: {condition: service_healthy}
@@ -137,25 +185,45 @@ services:
     container_name: mongos
     hostname: mongos
     restart: unless-stopped
-    command: mongos --configdb cfgrs/mongo_cfgserv:27017 --bind_ip_all --port 27017
+    command: >-
+      mongos --configdb cfgrs/mongo_cfgserv:27017 --bind_ip_all --port 27017
+      --keyFile /keyfile/mongo.key
+    volumes:
+      - mongo_keyfile:/keyfile:ro
     ports:
-      # Loopback only. The old setup published every mongod on 0.0.0.0 with no
-      # authentication; this stays exposed purely for the load-test scripts.
+      # Loopback only, and now password protected. The old setup published every
+      # mongod on 0.0.0.0 with no authentication at all.
       - "127.0.0.1:27017:27017"
     depends_on:
-      mongo_replicaset_init: {condition: service_completed_successfully}
+      mongo_cfg_init: {condition: service_completed_successfully}
+      mongo_shard_init: {condition: service_completed_successfully}
     healthcheck: *mongod-healthcheck
 
-  # One-shot: addShard + enableSharding + shardCollection + indexes.
+  # Creates the root and application users via the localhost exception, which
+  # closes permanently once the first user exists.
+  mongo_user_init:
+    image: mongo:8.0
+    container_name: mongo_user_init
+    restart: "no"
+    network_mode: "service:mongos"
+    environment: *mongo-admin-env
+    volumes:
+      - ./src/infra/mongo-init:/scripts:ro
+    command: ["bash", "/scripts/init-users.sh"]
+    depends_on:
+      mongos: {condition: service_healthy}
+
+  # addShard + enableSharding + shardCollection + indexes, authenticated.
   mongo_sharding_init:
     image: mongo:8.0
     container_name: mongo_sharding_init
     restart: "no"
+    environment: *mongo-admin-env
     volumes:
       - ./src/infra/mongo-init:/scripts:ro
     command: ["bash", "/scripts/init-sharding.sh"]
     depends_on:
-      mongos: {condition: service_healthy}
+      mongo_user_init: {condition: service_completed_successfully}
 
   # ------------------------------------------------------------------- Backend
   # A single replicated service, NOT backend1..backend4. Named services are
@@ -227,6 +295,7 @@ volumes:
   mongodb1:
   mongodb2:
   mongodb3:
+  mongo_keyfile:
   zoo1_data:
   zoo1_datalog:
   zoo2_data:

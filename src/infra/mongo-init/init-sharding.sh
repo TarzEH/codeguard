@@ -4,26 +4,34 @@
 # The old project called itself sharded but never ran enableSharding or
 # shardCollection, so every document lived in a single chunk on one shard -
 # that is replication, not sharding. This is the missing step.
+#
+# Runs after init-users.sh, so it authenticates as root rather than relying on
+# the localhost exception (which is closed once the first user exists).
 set -euo pipefail
 
 MONGOS_HOST="${MONGOS_HOST:-mongos:27017}"
 SHARD_SPEC="${SHARD_SPEC:-rs0/mongodb1:27017,mongodb2:27017,mongodb3:27017}"
-DB_NAME="${DB_NAME:-codeguard}"
+DB_NAME="${MONGO_DB:-codeguard}"
 COLLECTION="${COLLECTION:-vulnerability_cache}"
+ROOT_USER="${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME is required}"
+ROOT_PASS="${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is required}"
 ATTEMPTS="${ATTEMPTS:-90}"
 
 log() { echo "[init-sharding] $*"; }
 
+AUTH=(-u "$ROOT_USER" -p "$ROOT_PASS" --authenticationDatabase admin)
+
 log "waiting for mongos on $MONGOS_HOST"
 for _ in $(seq 1 "$ATTEMPTS"); do
-  if mongosh --quiet --host "$MONGOS_HOST" --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
-    log "mongos is accepting connections"
+  if mongosh --quiet --host "$MONGOS_HOST" "${AUTH[@]}" \
+       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+    log "mongos is accepting authenticated connections"
     break
   fi
   sleep 2
 done
 
-mongosh --quiet --host "$MONGOS_HOST" --eval '
+mongosh --quiet --host "$MONGOS_HOST" "${AUTH[@]}" --eval '
   const shardSpec = "'"$SHARD_SPEC"'";
   const dbName = "'"$DB_NAME"'";
   const collection = "'"$COLLECTION"'";
@@ -62,8 +70,6 @@ mongosh --quiet --host "$MONGOS_HOST" --eval '
     print("ttl index ensured (30d)");
   } catch (e) { print("ttl index skipped: " + e.codeName); }
   print("indexes ensured");
-
-  printjson(sh.status());
 '
 
 log "sharding is ready"

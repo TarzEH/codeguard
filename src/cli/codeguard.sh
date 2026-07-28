@@ -9,7 +9,7 @@
 set -o pipefail
 
 CODEGUARD_URL="${CODEGUARD_URL:-http://localhost:80}"
-CODEGUARD_VERSION="2.0.0"
+CODEGUARD_VERSION="2.1.0"
 OUTPUT_JSON=0
 WIDTH=74
 
@@ -125,10 +125,10 @@ renderReport() {
             .package,
             (.version // "*"),
             (.vulnerability_count | tostring),
-            # Cap the id list so it cannot overflow the report width; the full
-            # set is always available via `codeguard -j`.
-            (($ids[0:4] | join(", ")) +
-             (if ($ids | length) > 4 then " +\($ids | length - 4) more" else "" end)),
+            # Three ids max: 12-space indent + 3 ids + " +N more" stays inside
+            # the 74-column report. The full set is available via `codeguard -j`.
+            (($ids[0:3] | join(", ")) +
+             (if ($ids | length) > 3 then " +\($ids | length - 3) more" else "" end)),
             (.vulnerabilities | map(.fixed_in[]?) | unique | join(" "))
         ] | @tsv')
 
@@ -265,27 +265,61 @@ while getopts ":s:juhv" o; do
             exit $scan_rc
             ;;
         u)
-            # Update to the latest release.
-            # NOTE: the archive is fetched over HTTPS but is NOT signature
-            # verified. Publishing signed releases and checking the signature
-            # here is still an open item.
+            # Update to the latest release, verifying the archive against the
+            # SHA256SUMS published with it. A security tool must not install
+            # code it cannot verify, so a missing checksum file is a hard stop
+            # rather than a warning.
             set -e
-            wd=$(pwd)
-            latest_tag=$(curl -sS --fail --proto '=https' --tlsv1.2 \
-                https://api.github.com/repos/Naor-Yekutiely/codeguard/releases/latest \
-                | jq -r '.tag_name')
+            repo="${CODEGUARD_REPO:-Naor-Yekutiely/codeguard}"
+            workdir=$(mktemp -d "${TMPDIR:-/tmp}/codeguard-update.XXXXXX")
+            trap 'rm -rf "$workdir"' EXIT
+
+            release=$(curl -sS --fail --proto '=https' --tlsv1.2 \
+                "https://api.github.com/repos/$repo/releases/latest")
+            latest_tag=$(printf '%s' "$release" | jq -r '.tag_name')
             if ! [[ "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 printf 'Refusing to install unexpected release tag: %s\n' "'$latest_tag'" >&2
                 exit 2
             fi
-            printf 'Installing codeguard CLI %s\n' "$latest_tag"
-            curl -sS --fail --proto '=https' --tlsv1.2 -JLO \
-                "https://github.com/Naor-Yekutiely/codeguard/archive/$latest_tag.tar.gz"
-            latest_tag_num="${latest_tag:1}"
-            tar -xf "codeguard-$latest_tag_num.tar.gz"
-            (cd "codeguard-$latest_tag_num/src/cli" && ./install_cli.sh)
-            cd "$wd"
-            rm -rf "codeguard-$latest_tag_num.tar.gz" "codeguard-$latest_tag_num"
+            if [ "$latest_tag" = "v$CODEGUARD_VERSION" ]; then
+                printf 'Already on the latest release (%s)\n' "$latest_tag"
+                exit 0
+            fi
+
+            sums_url=$(printf '%s' "$release" \
+                | jq -r '.assets[]? | select(.name=="SHA256SUMS") | .browser_download_url')
+            if [ -z "$sums_url" ] || [ "$sums_url" = "null" ]; then
+                printf 'Release %s publishes no SHA256SUMS - refusing to install unverified code.\n' "$latest_tag" >&2
+                printf 'Install manually from source if you trust it.\n' >&2
+                exit 2
+            fi
+
+            tarball="codeguard-${latest_tag:1}.tar.gz"
+            printf 'Fetching codeguard %s\n' "$latest_tag"
+            curl -sS --fail --proto '=https' --tlsv1.2 -L \
+                -o "$workdir/$tarball" \
+                "https://github.com/$repo/archive/refs/tags/$latest_tag.tar.gz"
+            curl -sS --fail --proto '=https' --tlsv1.2 -L -o "$workdir/SHA256SUMS" "$sums_url"
+
+            expected=$(awk -v f="$tarball" '$2 == f || $2 == "*"f {print $1}' "$workdir/SHA256SUMS" | head -1)
+            if [ -z "$expected" ]; then
+                printf 'SHA256SUMS has no entry for %s - refusing to install.\n' "$tarball" >&2
+                exit 2
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual=$(sha256sum "$workdir/$tarball" | awk '{print $1}')
+            else
+                actual=$(shasum -a 256 "$workdir/$tarball" | awk '{print $1}')
+            fi
+            if [ "$expected" != "$actual" ]; then
+                printf 'Checksum mismatch - refusing to install.\n  expected %s\n  actual   %s\n' \
+                    "$expected" "$actual" >&2
+                exit 2
+            fi
+            printf 'Checksum verified.\n'
+
+            tar -xf "$workdir/$tarball" -C "$workdir"
+            (cd "$workdir/codeguard-${latest_tag:1}/src/cli" && ./install_cli.sh)
             set +e
             ;;
         h)
