@@ -24,8 +24,19 @@ scanning core, the coordination layer and the deployment.
 
 Requires Docker, Docker Compose, `jq`, and optionally `pipreqs`.
 
+**Just the CLI** — one verified file, no clone:
+
 ```bash
-git clone https://github.com/Naor-Yekutiely/codeguard.git && cd codeguard
+curl -fsSLO https://github.com/TarzEH/codeguard/releases/latest/download/codeguard
+curl -fsSLO https://github.com/TarzEH/codeguard/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+chmod +x codeguard && sudo mv codeguard /usr/local/bin/
+```
+
+**The whole cluster** — clone and run the installer:
+
+```bash
+git clone https://github.com/TarzEH/codeguard.git && cd codeguard
 ./install.sh
 ```
 
