@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  shell-lint:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S warning \
+            src/cli/codeguard.sh \
+            src/cli/install_cli.sh \
+            src/infra/mongo-init/*.sh \
+            tests/integration/failover_test.sh
+
+  integration:
+    name: Cluster integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the cluster
+        # Not `--wait`: it races against the one-shot init containers, which
+        # exit by design and can be removed while compose is still inspecting.
+        run: |
+          docker compose up -d --build
+          for _ in $(seq 1 90); do
+            healthy=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            if [ "$healthy" -ge 10 ] && curl -sf -o /dev/null http://127.0.0.1:80/health; then
+              echo "cluster ready ($healthy healthy services)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "cluster did not become ready"; docker compose ps -a; exit 1
+
+      - name: Cluster topology is what we claim it is
+        run: |
+          set -e
+          echo "--- ZooKeeper quorum ---"
+          for z in zoo1 zoo2 zoo3; do
+            docker exec $z zkServer.sh status 2>&1 | grep -E 'Mode: (leader|follower)'
+          done
+          echo "--- collection is actually sharded ---"
+          docker exec mongos mongosh --quiet --eval '
+            const c = db.getSiblingDB("config").collections.findOne(
+              {_id: "codeguard.vulnerability_cache"});
+            if (!c || c.dropped) { print("NOT SHARDED"); quit(1); }
+            print("shard key: " + JSON.stringify(c.key));'
+
+      - name: Scan smoke test
+        run: |
+          set -e
+          # A known-vulnerable version must report findings...
+          test "$(curl -s -X POST http://127.0.0.1:80/scan \
+            -H 'Content-Type: application/json' \
+            -d '{"dependencies":["flask==2.2.2"]}' | jq '.vulnerable')" -gt 0
+          # ...and a patched one must come back clean.
+          test "$(curl -s -X POST http://127.0.0.1:80/scan \
+            -H 'Content-Type: application/json' \
+            -d '{"dependencies":["flask==3.1.3"]}' | jq '.vulnerable')" -eq 0
+          # A malformed request must not be reported as clean.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:80/scan \
+            -H 'Content-Type: application/json' -d '{"nope":1}')" = "400"
+
+      - name: Scaling test
+        run: |
+          set -e
+          up() { curl -s -u admin:changeme 'http://127.0.0.1:8404/;csv' \
+                 | awk -F, '$1=="flaskservers" && $2!="BACKEND" && $18=="UP"{n++} END{print n+0}'; }
+          docker compose up -d --no-recreate --scale backend=6 backend
+          for _ in $(seq 1 30); do [ "$(up)" -ge 6 ] && break; sleep 2; done
+          test "$(up)" -ge 6
+          echo "HAProxy discovered 6 replicas without a restart"
+
+      - name: Failover test
+        run: ./tests/integration/failover_test.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 100

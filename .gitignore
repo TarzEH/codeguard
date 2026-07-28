@@ -1,2 +1,20 @@
-*/__pycache__/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS
 .DS_Store
+
+# MongoDB state. The cluster now initialises itself on `docker compose up`
+# (see src/infra/mongo-init/), so database files must never be committed.
+# This directory is left over from the old manual setup and can be deleted.
+src/mongoDB/mongo-data/
+
+# Local overrides
+.env
+
+# Written by the CLI while building a scan request
+dep.json
