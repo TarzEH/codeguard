@@ -8,7 +8,7 @@
 # Used by demo/autoscale.tape to record assets/demo-autoscale.gif.
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 URL="${CODEGUARD_URL:-http://127.0.0.1:80}"
 CONNECTIONS="${CONNECTIONS:-40}"

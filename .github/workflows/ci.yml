@@ -27,10 +27,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -S warning \
-            src/cli/codeguard.sh \
-            src/cli/install_cli.sh \
+            install.sh \
+            src/cli/*.sh \
+            scripts/*.sh \
             src/infra/mongo-init/*.sh \
-            tests/integration/failover_test.sh
+            tests/integration/*.sh \
+            demo/*.sh
 
   integration:
     name: Cluster integration
@@ -41,16 +43,25 @@ jobs:
       - name: Build and start the cluster
         # Not `--wait`: it races against the one-shot init containers, which
         # exit by design and can be removed while compose is still inspecting.
+        #
+        # Readiness is a functional check, not a count of healthy services: a
+        # 200 from HAProxy already means the backend, ZooKeeper and the whole
+        # sharded Mongo chain came up. Counting services broke the moment the
+        # default replica count changed.
         run: |
           docker compose up -d --build
           for _ in $(seq 1 90); do
-            healthy=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
-            if [ "$healthy" -ge 10 ] && curl -sf -o /dev/null http://127.0.0.1:80/health; then
-              echo "cluster ready ($healthy healthy services)"; exit 0
+            if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:80/health; then
+              echo "cluster ready"
+              docker compose ps
+              exit 0
             fi
             sleep 5
           done
-          echo "cluster did not become ready"; docker compose ps -a; exit 1
+          echo "cluster did not become ready"
+          docker compose ps -a
+          docker compose logs --tail 50
+          exit 1
 
       - name: Cluster topology is what we claim it is
         run: |
@@ -86,7 +97,7 @@ jobs:
           set -e
           up() { curl -s -u admin:changeme 'http://127.0.0.1:8404/;csv' \
                  | awk -F, '$1=="flaskservers" && $2!="BACKEND" && $18=="UP"{n++} END{print n+0}'; }
-          docker compose up -d --no-recreate --scale backend=6 backend
+          docker compose up -d --no-deps --no-recreate --scale backend=6 backend
           for _ in $(seq 1 30); do [ "$(up)" -ge 6 ] && break; sleep 2; done
           test "$(up)" -ge 6
           echo "HAProxy discovered 6 replicas without a restart"

@@ -85,7 +85,7 @@ if [ "$current_replicas" -lt "$REQUIRED_REPLICAS" ]; then
 fi
 
 head1 1 "exactly one leader at steady state"
-current=($(leaders))
+read -ra current <<< "$(leaders)"
 check "$([ ${#current[@]} -eq 1 ] && echo 0 || echo 1)" \
       "one leader elected" "found: ${current[*]:-none}"
 original="${current[0]:-}"
@@ -98,7 +98,7 @@ docker stop "$original" >/dev/null 2>&1
 start=$(date +%s)
 new=""
 for _ in $(seq 1 "$MAX_FAILOVER_SECONDS"); do
-    candidates=($(leaders))
+    read -ra candidates <<< "$(leaders)"
     if [ ${#candidates[@]} -eq 1 ] && [ "${candidates[0]}" != "$original" ]; then
         new="${candidates[0]}"; break
     fi
@@ -119,7 +119,7 @@ echo
 head1 4 "recovered node rejoins without a split brain"
 docker start "$original" >/dev/null 2>&1
 sleep 15
-final=($(leaders))
+read -ra final <<< "$(leaders)"
 check "$([ ${#final[@]} -eq 1 ] && echo 0 || echo 1)" \
       "still exactly one leader after recovery" "found: ${final[*]:-none}"
 note "leader is ${final[0]:-none}"

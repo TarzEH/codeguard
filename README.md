@@ -1,6 +1,7 @@
 # 🛡️ codeguard
 
-[![CI](https://github.com/Naor-Yekutiely/codeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/Naor-Yekutiely/codeguard/actions/workflows/ci.yml)
+[![CI](https://github.com/TarzEH/codeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/TarzEH/codeguard/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/TarzEH/codeguard?color=2CC0A6)](https://github.com/TarzEH/codeguard/releases/latest)
 ![Python](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
 ![MongoDB](https://img.shields.io/badge/MongoDB-8.0_sharded-47A248?logo=mongodb&logoColor=white)
 ![ZooKeeper](https://img.shields.io/badge/ZooKeeper-3.9_ensemble-D22128?logo=apachezookeeper&logoColor=white)
