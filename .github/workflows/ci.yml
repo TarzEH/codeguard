@@ -37,6 +37,12 @@ jobs:
   integration:
     name: Cluster integration
     runs-on: ubuntu-latest
+    # Same values docker-compose.yml falls back to when there is no .env.
+    # Real deployments get random credentials from install.sh.
+    env:
+      MONGO_ROOT_USERNAME: codeguard_root
+      MONGO_ROOT_PASSWORD: changeme_root
+      HAPROXY_STATS_PASSWORD: changeme
     steps:
       - uses: actions/checkout@v4
 
@@ -70,8 +76,16 @@ jobs:
           for z in zoo1 zoo2 zoo3; do
             docker exec $z zkServer.sh status 2>&1 | grep -E 'Mode: (leader|follower)'
           done
+          echo "--- MongoDB rejects unauthenticated access ---"
+          docker exec mongos mongosh --quiet --eval \
+            'db.getSiblingDB("codeguard").vulnerability_cache.countDocuments({})' 2>&1 \
+            | grep -q 'requires authentication'
+          echo "unauthenticated access denied"
+
           echo "--- collection is actually sharded ---"
-          docker exec mongos mongosh --quiet --eval '
+          docker exec mongos mongosh --quiet \
+            -u "$MONGO_ROOT_USERNAME" -p "$MONGO_ROOT_PASSWORD" \
+            --authenticationDatabase admin --eval '
             const c = db.getSiblingDB("config").collections.findOne(
               {_id: "codeguard.vulnerability_cache"});
             if (!c || c.dropped) { print("NOT SHARDED"); quit(1); }
@@ -95,7 +109,7 @@ jobs:
       - name: Scaling test
         run: |
           set -e
-          up() { curl -s -u admin:changeme 'http://127.0.0.1:8404/;csv' \
+          up() { curl -s -u "admin:$HAPROXY_STATS_PASSWORD" 'http://127.0.0.1:8404/;csv' \
                  | awk -F, '$1=="flaskservers" && $2!="BACKEND" && $18=="UP"{n++} END{print n+0}'; }
           docker compose up -d --no-deps --no-recreate --scale backend=6 backend
           for _ in $(seq 1 30); do [ "$(up)" -ge 6 ] && break; sleep 2; done
