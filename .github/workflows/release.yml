@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify tag matches source version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag to CODEGUARD_VERSION
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          src=$(grep -oP 'CODEGUARD_VERSION="\K[^"]+' src/cli/codeguard.sh)
+          if [ "$tag" != "$src" ]; then
+            echo "::error::Tag v$tag does not match CODEGUARD_VERSION=$src"
+            exit 1
+          fi
+          echo "Tag v$tag matches source version"
+
+  test:
+    name: CI suite
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Create GitHub Release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          # Extract the section for this version from CHANGELOG.md
+          section=$(awk -v ver="$tag" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]")) found=1
+              next
+            }
+            found { print }
+          ' CHANGELOG.md)
+          # Write to file for gh release
+          echo "$section" > /tmp/release-notes.md
+
+      - name: Determine pre-release flag
+        id: prerelease
+        run: |
+          if echo "$GITHUB_REF" | grep -qE '\-'; then
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes-file /tmp/release-notes.md \
+            ${{ steps.prerelease.outputs.flag }}
